@@ -1,0 +1,192 @@
+#!/usr/local/bin/gawk -f
+
+# getPhotos: Reads list of current photos from each Flickr source,
+#   checks whether a copy exists in the DB, downloads, converts, and
+#   writes to DB
+# Copyright (c) 2014, Campbell Webb <cwebb@oeb.harvard.edu>
+# Free/Open Source Software using GPL v3 license 
+# Requires: gawk (v4+), openssl, base64, curl, echo
+
+@load "/usr/local/lib/gawk/xml.so"
+@include "../lib/oauth.awk" ;
+@include "../lib/secrets.awk" ;
+@include "../lib/db.awk" ;
+
+BEGIN {
+
+  # Initialize
+  XMLMODE=0;
+  XMLCHARSET="utf-8"
+  RS="\n";
+  ORS="";
+  srand();
+  loadSecrets();
+
+  # Sources: 
+  # 'Ned's best' photoset:
+  SOURCE = "method=flickr.photosets.getPhotos&photoset_id=72157644449833691";
+  USERNO = 34;
+  # Arnold Arboretum staff group (Maggie R):
+  # SOURCE = "method=flickr.people.getPhotos&user_id=28082034@N05";
+  # USERNO = 35;
+  # Cam:
+  # SOURCE = "method=flickr.people.getPhotos&user_id=52821549@N03";
+  # USERNO = 36;
+
+  ## 0. Get list of images already in DB
+  queryDB("SELECT `flickrID` FROM `flickr`");
+  for (i = 1; i <= DBQr; i++) tested[ DBQ[i, "flickrID"] ] = 1 ;
+  clearDBQ();
+
+  # Also get the user name, for watermarking
+  queryDB("SELECT `who` FROM `person` WHERE `id` = " USERNO);
+  USERNAME = DBQ[1, "who"];
+  clearDBQ();
+  
+  ## 1. Request photolist
+
+  print "---------- " strftime("%F %H:%M") " ----------\n" >> "../log/fs.log";
+  print "   " SOURCE >> "../log/fs.log";
+  print  "\n1. Requesting photo list:     "  >> "../log/fs.log";
+  page = 1; pages = 1;
+  while (page <= pages) {
+    print "."  >> "../log/fs.log"; close("../log/fs.log");
+    cmd = requestCmd( SOURCE "&per_page=500&page=" page);
+
+    # # EITHER: Send the request, non-XML-mode, save file, then read back:
+    # RS="\x04";
+    # cmd | getline response; close(cmd); 
+    # print response > "../tmp/photo_list.xml" ; close("../tmp/photo_list.xml");
+    # XMLMODE=1;
+    # while (( getline < "../tmp/photo_list.xml") > 0 ) {
+    #  if (XMLSTARTELEM == "photo") photo[XMLATTR["id"]]++;
+    # }
+    # XMLMODE=0;
+
+    # OR: Send the request, reading it back through XML mode
+    # Testing only for unseen images
+    XMLMODE=1;
+    while (( cmd | getline ) > 0 ) {
+      if (XMLSTARTELEM == "photos") pages = XMLATTR["pages"];
+      if (XMLSTARTELEM == "photoset") pages = XMLATTR["pages"];
+      if (XMLSTARTELEM == "photo") 
+        if (!tested[XMLATTR["id"]]) photo[XMLATTR["id"]]++;
+    }
+    close(cmd);
+    XMLMODE=0;
+    page++;
+  }
+
+  # No new ones:
+  if (!length(photo)) {
+    print "\n*  No new photos. Exiting...\n\n"  >> "../log/fs.log";
+    exit;
+  }
+
+  # Update tested list in DB
+  sql = "INSERT INTO flickr (flickrID) VALUES ('";
+  for (i in photo) sql = sql i "'),('";
+  gsub(/,\('$/,";", sql);
+  sendSQL(sql);
+
+  # 2. Ask for the metadata for each photo
+  print "\n2. Getting metadata:          " >> "../log/fs.log";
+  tmpcount = 0;
+  for (i in photo)
+    {
+      print "."  >> "../log/fs.log"; close("../log/fs.log");
+      # if (tmpcount++ > 10) break;
+      cmd = requestCmd("method=flickr.photos.getInfo&photo_id=" i ) ;
+
+      # RS="\x04"; # interesting - needs to be reset each response
+      # cmd | getline response;
+      # close(cmd); print response;
+
+      XMLMODE=1;
+      tmptag = "";
+      while (( cmd | getline ) > 0 ) {
+        if (XMLSTARTELEM == "dates") date[i] = substr(XMLATTR["taken"],1,10);
+        # concatenate tags and description strings
+        if (XMLSTARTELEM == "tag") tmptag = tmptag " " XMLATTR["raw"];
+        if (XMLCHARDATA) { data = $0 }
+        if (XMLENDELEM == "description") tmptag = tmptag " " data ;
+      }
+      close(cmd);
+      XMLMODE=0;
+
+      # Process tags. In case of minor slips:
+      gsub(/\*/,"-",tmptag); 
+      # add a marker to the beginning of all occurrences of the pattern:
+      tmptag = gensub(/([0-9]+|NAC)(\-?[0-9]*)(\-[A-Z]|\-MASS)/,
+                      "\x1E\\1\\2\\3", "G", tmptag);
+      # check for the pattern:
+      if (tmptag !~ "\x1E") tmptag = "";
+      # remove all in front of the first pattern:
+      gsub(/^.*\x1E/,"", tmptag); 
+      # add a marker to the end of all occurrences of the pattern:
+      tmptag = gensub(/([0-9]+|NAC)(\-?[0-9]*)(\-[A-Z]|\-MASS)/,
+                      "\\1\\2\\3\x1E", "G", tmptag);
+      # remove the first marker and all following it:
+      gsub(/\x1E.*$/,"", tmptag);
+      # 
+      if (tmptag != "") tag[i] = tmptag; 
+      # print i , tag[i] ; ## NB, by asking for tag[i] you create it!
+    }
+
+  # 3. Get URL
+  print "\n3. Getting download URL:      " >> "../log/fs.log";
+  for (i in tag) {
+    print "."  >> "../log/fs.log"; close("../log/fs.log");
+    cmd = requestCmd("method=flickr.photos.getSizes&photo_id=" i ) ;
+    XMLMODE=1;
+    while (( cmd | getline ) > 0 ) {
+      if (XMLSTARTELEM == "size") url[i] = XMLATTR["source"];
+    }
+    # Due ot the order of the XML, the last time this is set it is the largest
+    close(cmd);
+    XMLMODE=0;
+    # print url[i];
+  }
+
+  # 4. Download and converting
+  sql = "INSERT INTO `image` (`md5`, `fname`, `accno`, `date`, `personID`) \
+         VALUES ";
+  print "\n4. Downloading:               " >> "../log/fs.log";
+  for (i in url) {
+    print "."  >> "../log/fs.log"; close("../log/fs.log");
+    system("curl -s \"" url[i] "\" > ../tmp/" i ".jpg");
+
+    cmd = "md5sum ../tmp/" i ".jpg | awk 'BEGIN{ORS=\"\"}{print $1}'" ;
+    cmd | getline md5;
+    close(cmd);
+    system("convert -quiet ../tmp/" i ".jpg -resize 1000x1000 -font helvetica -pointsize 25 -fill blue -gravity SouthEast -draw \"text 25,60 '" USERNAME "'\" -draw \"text 25,25 'Arnold Arboretum'\" ../tmp/" md5 ".lg.jpg");
+    system("convert -quiet ../tmp/" i ".jpg -resize 100x100 ../tmp/" md5 \
+           ".th.jpg");
+    # print md5 "|" i ".jpg|" tag[i] "|" date[i] "|" USERNO >> "../tmp/data.csv";
+    # close("../tmp/data.csv");    # Kyle = 32; Michael = 31; Nancy = 33; Ned = 34; staff = 35
+    sql = sql "('" md5 "','" i ".jpg','" tag[i] "','" date[i] "'," USERNO "),";
+  }
+  print "\n\n"  >> "../log/fs.log";
+  gsub(/,$/,";",sql);
+  # print sql;
+  sendSQL(sql);
+
+  sendSQL("UPDATE `plant`, `image` SET `image`.`plantID` = `plant`.`id` \
+           WHERE `image`.`personID` = " USERNO " AND \
+           REPLACE(`image`.`accno`, '*', '-') = \
+             REPLACE(`plant`.`tag`, '*', '-');") ;
+
+  system("mv -f ../tmp/*lg.jpg /home/labs/labs.arb/aaimg/img/");
+  system("mv -f ../tmp/*th.jpg /home/labs/labs.arb/aaimg/img/");
+  system("mv -f ../tmp/*.jpg /home/labs/projects/flickr_ori/");
+
+  exit;
+
+}
+
+# To recreate links from scratch: UPDATE  `plant` , `image` SET  
+# `image`.`plantID` =  `plant`.`id` WHERE CONCAT(  `image`.`accno` ,  '*A' ) = 
+# `plant`.`tag`
+# UPDATE `plant`, `image` SET `image`.`plantID` = `plant`.`id` 
+# WHERE REPLACE(`image`.`accno`, '*', '-') = 
+# REPLACE(`plant`.`tag`, '*', '-');") ;

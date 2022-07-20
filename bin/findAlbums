@@ -1,0 +1,104 @@
+#!/usr/local/bin/gawk -f
+
+# findAlbums
+
+# Requires: gawk (v4+), openssl, base64, curl, echo
+
+@load "/usr/local/lib/gawk/xml.so"
+@include "../lib/oauth.awk" ;
+@include "../lib/secrets.awk" ;
+@include "../lib/db.awk" ;
+
+BEGIN {
+
+  # Initialize
+  XMLMODE=0;
+  XMLCHARSET="utf-8"
+  RS="\n";
+  ORS="";
+  srand();
+  loadSecrets();
+
+  # # loupuk's albums:
+  # SOURCE = "method=flickr.photosets.getList&user_id=102148157%40N08";
+  
+  # page = 1; pages = 1;
+  # while (page <= pages) {
+  #   cmd = requestCmd( SOURCE "&per_page=500&page=" page);
+  #   XMLMODE=1;
+  #   while (( cmd | getline ) > 0 ) {
+  #     if (XMLSTARTELEM == "photosets") pages = XMLATTR["pages"];
+  #     if (XMLSTARTELEM == "photoset") idtmp = XMLATTR["id"];
+  #     if (XMLCHARDATA) { data = $0 };
+  #     if (XMLENDELEM == "title")       title[idtmp] = data ;
+  #     if (XMLENDELEM == "description") desc[idtmp]  = \
+  #                                        gensub(/[\n\r\l\t]+$/,"","G",data) ;
+  #     # note that an empty data element is full of tabs!
+  #   }
+  #   close(cmd);
+  #   XMLMODE=0;
+  #   page++;
+  # }
+
+  # for (i in title)
+  #   print i "|" title[i] "|" desc[i] "\n";
+
+  # Get the photo list for an album (not likely to be more than 500):
+
+  SOURCE = "method=flickr.photosets.getPhotos&photoset_id=72157642193981464";
+  albumID = "72157642193981464";
+
+  print "Getting photo list\n" > "/dev/stderr";
+  cmd = requestCmd( SOURCE "&per_page=500&page=" page);
+  XMLMODE=1;
+  while (( cmd | getline ) > 0 ) {
+    if (XMLSTARTELEM == "photo") inAlbum[XMLATTR["id"]] = albumID;
+  }
+  close(cmd);
+  XMLMODE=0;
+
+  # get the metadata
+  for (i in inAlbum) {
+    print "Getting metadata for " i "\n" > "/dev/stderr";
+    cmd = requestCmd("method=flickr.photos.getInfo&photo_id=" i ) ;
+    XMLMODE=1;
+    tmptag = "";
+    while (( cmd | getline ) > 0 ) {
+      if (XMLSTARTELEM == "photo") license[i] = XMLATTR["license"];
+      if (XMLSTARTELEM == "dates") date[i] = substr(XMLATTR["taken"],1,10);
+    }
+    close(cmd);
+    XMLMODE=0;
+  }
+
+  # 3. Get URL
+  for (i in inAlbum) {
+    print "Getting URL for " i "\n" > "/dev/stderr";
+    cmd = requestCmd("method=flickr.photos.getSizes&photo_id=" i ) ;
+    XMLMODE=1;
+    while (( cmd | getline ) > 0 ) {
+      if (XMLSTARTELEM == "size") url[i] = XMLATTR["source"];
+    }
+    # Due ot the order of the XML, the last time this is set it is the largest
+    close(cmd);
+    XMLMODE=0;
+  }
+
+  for (i in inAlbum)
+    print i "|" inAlbum[i] "|" license[i] "|" date[i] "|" url[i] "\n";
+  
+  exit;
+
+}
+
+# Licenses: flickr.photos.licenses.getInfo
+
+#  license id="0" name="All Rights Reserved"
+#  license id="1" name="Attribution-NonCommercial-ShareAlike License"
+#  license id="2" name="Attribution-NonCommercial License"
+#  license id="3" name="Attribution-NonCommercial-NoDerivs License"
+#  license id="4" name="Attribution License"
+#  license id="5" name="Attribution-ShareAlike License"
+#  license id="6" name="Attribution-NoDerivs License"
+#  license id="7" name="No known copyright restrictions"
+#  license id="8" name="United States Government Work"

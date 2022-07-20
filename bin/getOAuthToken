@@ -1,0 +1,104 @@
+#!/bin/gawk -f
+
+# getOAuthToken: Gets user-authorized token and sectret 
+#                from the Flickr OAuth API
+# Copyright (c) 2014, Campbell Webb <cwebb@oeb.harvard.edu>
+# Free/Open Source Software using GPL v3 license
+# Requires: gawk (v4+), openssl, base64, curl, echo
+
+@include "../lib/oauth.awk" ;
+@include "../lib/secrets.awk" ;
+# NB: @include paths in gawk are relative to dir from which the 
+#     script is _called_
+
+BEGIN {
+
+  loadSecrets();
+
+  # Initialize
+  srand();
+  RS="\n";
+
+  ## OAuth Step 1, request a user authorization token
+  print "\nStep 1: request an OAuth user authorization token";
+
+  uniq();
+  request = "https://www.flickr.com/services/oauth/request_token  \
+             ?oauth_nonce=" UNIQ "                                \
+             &oauth_timestamp=" TIME "                            \
+             &oauth_consumer_key=" API_KEY "                      \
+             &oauth_signature_method=HMAC-SHA1                    \
+             &oauth_version=1.0                                   \
+             &oauth_callback=http%3A%2F%2Fwww.example.com         " ;
+  gsub(/\s/,"", request);
+
+  # Sign the request and add the signature to the parameters
+  #   (at this stage, the HMAC key is just the api_secret)
+  request = request "&oauth_signature=" sign("GET", request, API_SECRET "&");
+ 
+  # Send the request
+  cmd = "curl -s \"" request "\"";
+  cmd | getline response;
+  close(cmd);
+
+  # Error check (need more...)
+  if (response !~ "oauth_callback_confirmed=true") {
+    print "Error requesting token. Exiting";  exit;  
+  }
+  
+  ## OAuth Step 2, Get the user to log in and authorize access 
+  split(response, respparam, "&");
+  auth_secret = respparam[3];
+  print "\nStep 2: User authorizes API activity in the user's name";
+  print "  Check your browser (chromium), and authorize (as a logged-in user).";
+  # replace with another browser if needed or use xdg-open
+  system("chromium \"https://www.flickr.com/services/oauth/authorize?" \
+         respparam[2] "\" >& /dev/null");
+
+  # Ask for the authorization token
+  print "  Paste the URL here, beginning at `oauth_token=...', then <ENTER>";
+  getline response < "/dev/stdin";
+
+  # Test answer
+  delete respparam;
+  split(response, respparam, "&");
+  if ((length(respparam[1]) != 46) && \
+      (substr(respparam[1], 1, 11) != "oauth_token") && \
+      (length(respparam[2]) != 31) && \
+      (substr(respparam[2], 1, 14) != "oauth_verifier")) {
+    print "Pasted string of wrong format. Sorry."; exit;
+  }
+
+  ## OAuth Step 3, Request access token, connecting app and user
+  print "\nStep 3: Request access token, connecting app and user";
+  uniq();
+  request = "https://www.flickr.com/services/oauth/access_token \
+      ?oauth_nonce=" UNIQ "                                     \
+      &oauth_timestamp=" TIME "                                 \
+      &oauth_consumer_key=" API_KEY "                           \
+      &oauth_signature_method=HMAC-SHA1                         \
+      &oauth_version=1.0&" response ;
+  gsub(/\s/,"", request);
+
+  request = request "&oauth_signature="                         \
+    sign("GET", request, API_SECRET "&" substr(auth_secret, 20, 16));
+
+  cmd = "curl -s \"" request "\"";
+  cmd | getline response;
+  close(cmd);
+  
+  # Error check
+  if (response !~ "username=") {
+    print "Error requesting token. Exiting";  exit;  
+  }
+
+  # Return token for further use (save to secrets.awk file)
+  delete respparam;
+  split(response, respparam, "&");
+  print "\n>>> " respparam[5];
+  print ">>> " respparam[2];
+  print ">>> " respparam[3];
+
+  exit;
+}
+
